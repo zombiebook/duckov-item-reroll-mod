@@ -203,6 +203,8 @@ namespace ItemReroll
 
         public int GetRandomID()
         {
+            if (_validItemIDs.Count == 0)
+                throw new InvalidOperationException("[ItemReroll] 유효 아이템 풀이 비었습니다. (더미 제외 후)");
             return _validItemIDs[UnityEngine.Random.Range(0, _validItemIDs.Count)];
         }
 
@@ -332,6 +334,10 @@ namespace ItemReroll
 
         private void AddItem(int typeID, int maxStack)
         {
+            // 더미 즉시 차단
+            if (!ItemReroll.DummyItemIds.IsAllowed(typeID))
+                return;
+
             if (!_validItemIDs.Contains(typeID))
             {
                 _validItemIDs.Add(typeID);
