@@ -287,7 +287,12 @@ namespace ItemReroll
                 }
                 
                 if (typeID <= 0) return false;
-                
+                  // 더미 즉시 차단
+            if (!ItemReroll.DummyItemIds.IsAllowed(typeID)){
+                 Debug.LogWarning($"{LOG_PREFIX} 더미아이템 제외: {typeID}");
+             return;
+            }
+               
                 var prefabField = entry.GetType().GetField("prefab", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 if (prefabField == null) return false;
                 
@@ -334,9 +339,7 @@ namespace ItemReroll
 
         private void AddItem(int typeID, int maxStack)
         {
-            // 더미 즉시 차단
-            if (!ItemReroll.DummyItemIds.IsAllowed(typeID))
-                return;
+          
 
             if (!_validItemIDs.Contains(typeID))
             {
