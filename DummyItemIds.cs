@@ -1,10 +1,10 @@
-using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
 
 namespace ItemReroll
 {
+    /// <summary>더미 아이템 ID 집합 및 필터 유틸.</summary>
     public static class DummyItemIds
     {
         private static readonly HashSet<int> Set = new HashSet<int>
