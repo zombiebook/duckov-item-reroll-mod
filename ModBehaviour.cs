@@ -10,42 +10,89 @@ namespace ItemReroll
 {
     public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
+        // ── 사용자 편집용 CFG ───────────────────────────────
+        private string? _cfgPath; // e.g., <persistentDataPath>/ItemReroll.cfg
+        private const string CFG_HEADER = "# ItemReroll config (editable)\n# Keys: RerollKey=F9\n";
+        // ────────────────────────────────────────────────────
+
         private const string LOG_PREFIX = "[ItemReroll]";
-        private const KeyCode REROLL_KEY = KeyCode.F9;
-        
+
+        // 커스텀 가능한 리롤 키 (기본 F9) + 리바인 상태
+        private KeyCode _rerollKey = KeyCode.F9;
+        private const string PREFS_REROLL_KEY = "ItemReroll.RerollKey";
+        private bool _waitingRebind = false; // 키 변경 대기 상태
+
         private readonly ItemDatabase _itemDatabase = new ItemDatabase();
         private readonly ItemFilter _itemFilter = new ItemFilter();
         private readonly ItemReroller _itemReroller = new ItemReroller();
         private bool _isRerolling;
 
-        void Awake()
+        private void Awake()
         {
             LogSection("모드 초기화 시작");
             Debug.Log($"{LOG_PREFIX} 리롤 대상: 컨테이너 아이템 (적 드롭, 자연 파밍 컨테이너)");
-            
+
             _itemDatabase.LoadFromGame();
-            
+
+            // CFG 경로 준비 & 로드 (없으면 생성), PlayerPrefs 보조 로드
+            _cfgPath = UnityEngine.Application.persistentDataPath + "/ItemReroll.cfg";
+            LoadConfig();           // CFG에서 키 우선 로드
+            LoadRerollKey();        // PlayerPrefs 값도 있으면 보조 로드 (CFG 우선)
+
             Debug.Log($"{LOG_PREFIX} 유효한 아이템 ID: {_itemDatabase.Count}개");
             if (_itemDatabase.Count > 0)
-            {
                 Debug.Log($"{LOG_PREFIX} ID 범위: {_itemDatabase.MinID} ~ {_itemDatabase.MaxID}");
-            }
-            
+
             Debug.Log($"{LOG_PREFIX} 모드 로드 완료!");
             LogSection("");
         }
-        
-        void Update()
+
+        private void Update()
         {
-            if (Input.GetKeyDown(REROLL_KEY))
+            // ── 키 리바인 토글: Insert ────────────────────────────────────────────
+            // 대기 중이 아닐 때만 토글 ON; Insert를 눌러 리바인 시작
+            if (!_waitingRebind && Input.GetKeyDown(KeyCode.Insert))
+            {
+                _waitingRebind = true;
+                Debug.Log("[ItemReroll] 키 변경 대기... 아무 키나 누르면 저장 (Esc로 취소)");
+            }
+
+            if (_waitingRebind)
+            {
+                // Esc로 취소 (이 키는 바인딩 대상에서 제외)
+                if (Input.GetKeyDown(KeyCode.Escape))
+                {
+                    _waitingRebind = false;
+                    Debug.Log("[ItemReroll] 키 변경 취소");
+                }
+                else
+                {
+                    // 다음에 눌린 아무 키나 새 리롤 키로 저장 (토글 키/취소 키 제외)
+                    foreach (KeyCode kc in Enum.GetValues(typeof(KeyCode)))
+                    {
+                        // None/Escape/Insert 제외 (Insert는 리바인 토글 키)
+                        if (kc == KeyCode.None || kc == KeyCode.Escape || kc == KeyCode.Insert) continue;
+                        if (Input.GetKeyDown(kc))
+                        {
+                            _waitingRebind = false;
+                            SetRerollKey(kc.ToString()); // 저장 & 적용 (CFG + PlayerPrefs)
+                            break;
+                        }
+                    }
+                }
+            }
+            // ───────────────────────────────────────────────────────────────────────
+
+            // 리롤 실행 키
+            if (Input.GetKeyDown(_rerollKey))
             {
                 if (_isRerolling)
                 {
                     Debug.LogWarning($"{LOG_PREFIX} 이미 리롤이 진행 중입니다. 대기 중...");
                     return;
                 }
-                
-                LogSection("F9 키 입력 감지! 리롤 시작...");
+
+                LogSection($"{_rerollKey} 키 입력 감지! 리롤 시작...");
                 StartCoroutine(PerformReroll());
             }
         }
@@ -53,11 +100,10 @@ namespace ItemReroll
         private IEnumerator PerformReroll()
         {
             if (_isRerolling) yield break;
-            
             _isRerolling = true;
-            
+
             List<Item> containerItems = null;
-            
+
             try
             {
                 containerItems = FindContainerItems();
@@ -70,35 +116,33 @@ namespace ItemReroll
                 _isRerolling = false;
                 yield break;
             }
-            
+
             if (containerItems == null || containerItems.Count == 0)
             {
                 Debug.Log($"{LOG_PREFIX} 리롤할 컨테이너 아이템이 없습니다.");
                 _isRerolling = false;
                 yield break;
             }
-            
+
             Debug.Log($"{LOG_PREFIX} [3단계] {containerItems.Count}개 컨테이너 아이템 리롤 시작...");
-            
+
             int successCount = 0;
             int failCount = 0;
-            
+
             for (int i = 0; i < containerItems.Count; i++)
             {
                 Debug.Log($"{LOG_PREFIX} [{i + 1}/{containerItems.Count}] 아이템 처리 중...");
-                
+
                 bool success = _itemReroller.RerollItem(containerItems[i], _itemDatabase);
-                
-                if (success)
-                    successCount++;
-                else
-                    failCount++;
-                
+
+                if (success) successCount++;
+                else failCount++;
+
                 yield return null;
             }
-            
+
             ShowResults(successCount, failCount);
-            
+
             _isRerolling = false;
             Debug.Log($"{LOG_PREFIX} 리롤 프로세스 완료. 다음 리롤 대기 중...");
         }
@@ -106,14 +150,14 @@ namespace ItemReroll
         private List<Item> FindContainerItems()
         {
             Debug.Log($"{LOG_PREFIX} [1단계] 월드의 모든 아이템 탐색 중...");
-            
+
             Item[] allItems = UnityEngine.Object.FindObjectsOfType<Item>();
             Debug.Log($"{LOG_PREFIX} 발견된 총 아이템 수: {allItems.Length}개");
-            
+
             Debug.Log($"{LOG_PREFIX} [2단계] 아이템 필터링 중... (컨테이너 아이템만)");
-            
+
             var filterResult = _itemFilter.FilterContainerItems(allItems);
-            
+
             Debug.Log($"{LOG_PREFIX} 필터링 결과:");
             Debug.Log($"{LOG_PREFIX}   - 리롤 대상: {filterResult.ContainerItems.Count}개");
             Debug.Log($"{LOG_PREFIX}   - 플레이어: {filterResult.PlayerCount}개");
@@ -121,7 +165,7 @@ namespace ItemReroll
             Debug.Log($"{LOG_PREFIX}   - 바닥: {filterResult.GroundCount}개");
             Debug.Log($"{LOG_PREFIX}   - 인벤토리: {filterResult.InventoryCount}개");
             Debug.Log($"{LOG_PREFIX}   - null/무효: {filterResult.NullCount}개");
-            
+
             return filterResult.ContainerItems;
         }
 
@@ -130,11 +174,11 @@ namespace ItemReroll
             Debug.Log($"{LOG_PREFIX} [4단계] 리롤 완료!");
             Debug.Log($"{LOG_PREFIX}   - 성공: {successCount}개");
             Debug.Log($"{LOG_PREFIX}   - 실패: {failCount}개");
-            
-            string message = successCount > 0 
-                ? $"{successCount}개 컨테이너 아이템 리롤!" 
+
+            string message = successCount > 0
+                ? $"{successCount}개 컨테이너 아이템 리롤!"
                 : "리롤할 컨테이너 아이템이 없습니다.";
-            
+
             LogSection(message);
             Debug.Log($"[알림] {message}");
         }
@@ -148,12 +192,120 @@ namespace ItemReroll
                 Debug.Log($"{LOG_PREFIX} ========================================");
             }
         }
+
+        // ───────────────────── CFG: Load / Save ─────────────────────
+        private void LoadConfig()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_cfgPath))
+                    _cfgPath = UnityEngine.Application.persistentDataPath + "/ItemReroll.cfg";
+
+                // 파일 없으면 생성(기본값 F9)
+                if (!global::System.IO.File.Exists(_cfgPath))
+                {
+                    var defaultText = CFG_HEADER + "RerollKey=F9\n";
+                    EnsureDirExists(_cfgPath);
+                    global::System.IO.File.WriteAllText(_cfgPath, defaultText);
+                    _rerollKey = KeyCode.F9;
+                    return;
+                }
+
+                // 파싱
+                var lines = global::System.IO.File.ReadAllLines(_cfgPath);
+                foreach (var raw in lines)
+                {
+                    var line = raw?.Trim();
+                    if (string.IsNullOrEmpty(line)) continue;
+                    if (line.StartsWith("#")) continue;
+                    var idx = line.IndexOf('=');
+                    if (idx <= 0) continue;
+                    var key = line.Substring(0, idx).Trim();
+                    var val = line.Substring(idx + 1).Trim();
+                    if (string.Equals(key, "RerollKey", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (Enum.TryParse<KeyCode>(val, true, out var parsed) &&
+                            parsed != KeyCode.None && parsed != KeyCode.Escape)
+                            _rerollKey = parsed;
+                    }
+                }
+                Debug.Log($"[ItemReroll] (CFG) 리롤 키: {_rerollKey}  path={_cfgPath}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[ItemReroll] CFG 로드 실패: {ex.Message}");
+            }
+        }
+
+        private void SaveConfig()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_cfgPath))
+                    _cfgPath = UnityEngine.Application.persistentDataPath + "/ItemReroll.cfg";
+
+                EnsureDirExists(_cfgPath);
+                var text = CFG_HEADER + $"RerollKey={_rerollKey}\n";
+                global::System.IO.File.WriteAllText(_cfgPath, text);
+                Debug.Log($"[ItemReroll] (CFG) 저장 완료: {_cfgPath}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[ItemReroll] CFG 저장 실패: {ex.Message}");
+            }
+        }
+
+        // 디렉터리 없으면 생성 (System.IO using 없이)
+        private static void EnsureDirExists(string filePath)
+        {
+            try
+            {
+                var dir = global::System.IO.Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrEmpty(dir) && !global::System.IO.Directory.Exists(dir))
+                    global::System.IO.Directory.CreateDirectory(dir);
+            }
+            catch { }
+        }
+        // ─────────────────────────────────────────────────────────────
+
+        private void LoadRerollKey()
+        {
+            if (PlayerPrefs.HasKey(PREFS_REROLL_KEY))
+            {
+                var saved = PlayerPrefs.GetString(PREFS_REROLL_KEY);
+                if (Enum.TryParse<KeyCode>(saved, true, out var key) &&
+                    key != KeyCode.None && key != KeyCode.Escape)
+                {
+                    // CFG에서 이미 읽은 값이 우선. 기본값 상태면 PlayerPrefs 적용.
+                    if (_rerollKey == KeyCode.F9) _rerollKey = key;
+                }
+            }
+            Debug.Log($"[ItemReroll] 리롤 키: {_rerollKey}");
+        }
+
+        // 콘솔/리바인 모드에서 공용으로 호출 가능 (예: SetRerollKey("F7"))
+        public void SetRerollKey(string keyName)
+        {
+            if (Enum.TryParse<KeyCode>(keyName, true, out var key) &&
+                key != KeyCode.None && key != KeyCode.Escape)
+            {
+                _rerollKey = key;
+                PlayerPrefs.SetString(PREFS_REROLL_KEY, key.ToString());
+                PlayerPrefs.Save();
+                SaveConfig(); // CFG에도 반영
+                Debug.Log($"[ItemReroll] 리롤 키가 '{_rerollKey}' 로 저장되었습니다.");
+            }
+            else
+            {
+                Debug.LogError($"[ItemReroll] 잘못된 키 이름: {keyName}");
+            }
+        }
     }
 
     internal class ItemDatabase
     {
         private const string LOG_PREFIX = "[ItemReroll]";
-        
+
         private readonly List<int> _validItemIDs = new List<int>();
         private readonly Dictionary<int, int> _stackCounts = new Dictionary<int, int>();
 
@@ -164,7 +316,7 @@ namespace ItemReroll
         public void LoadFromGame()
         {
             Debug.Log($"{LOG_PREFIX} 게임에서 아이템 ID 동적 로딩 중...");
-            
+
             try
             {
                 var collectionType = ReflectionHelper.FindType("ItemAssetsCollection");
@@ -173,26 +325,26 @@ namespace ItemReroll
                     Debug.LogError($"{LOG_PREFIX} ItemAssetsCollection 타입을 찾을 수 없습니다");
                     return;
                 }
-                
+
                 var collection = Resources.LoadAll<ScriptableObject>("")
                     .FirstOrDefault(obj => collectionType.IsAssignableFrom(obj.GetType()));
-                
+
                 if (collection == null)
                 {
                     Debug.LogError($"{LOG_PREFIX} ItemAssetsCollection 인스턴스를 찾을 수 없습니다");
                     return;
                 }
-                
+
                 var itemType = ReflectionHelper.FindType("ItemStatsSystem.Item");
                 if (itemType == null)
                 {
                     Debug.LogError($"{LOG_PREFIX} Item 타입을 찾을 수 없습니다");
                     return;
                 }
-                
+
                 int vanillaCount = LoadVanillaItems(collectionType, collection, itemType);
                 int moddedCount = LoadModdedItems(collectionType, itemType);
-                
+
                 Debug.Log($"{LOG_PREFIX} 로딩 완료: 바닐라 {vanillaCount}개, 모드 {moddedCount}개, 총 {Count}개");
             }
             catch (Exception ex)
@@ -216,20 +368,20 @@ namespace ItemReroll
         private int LoadVanillaItems(Type collectionType, ScriptableObject collection, Type itemType)
         {
             int count = 0;
-            
+
             var entriesField = collectionType.GetField("entries", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             if (entriesField == null)
             {
                 Debug.LogWarning($"{LOG_PREFIX} entries 필드를 찾을 수 없습니다");
                 return 0;
             }
-            
+
             if (!(entriesField.GetValue(collection) is IList entries))
             {
                 Debug.LogWarning($"{LOG_PREFIX} entries가 null입니다");
                 return 0;
             }
-            
+
             foreach (var entry in entries)
             {
                 if (TryExtractItemData(entry, itemType, out int typeID, out int maxStack))
@@ -238,27 +390,27 @@ namespace ItemReroll
                     count++;
                 }
             }
-            
+
             return count;
         }
 
         private int LoadModdedItems(Type collectionType, Type itemType)
         {
             int count = 0;
-            
+
             var dynamicDicField = collectionType.GetField("dynamicDic", BindingFlags.Static | BindingFlags.NonPublic);
             if (dynamicDicField == null)
             {
                 Debug.Log($"{LOG_PREFIX} dynamicDic 필드 없음 (모드 아이템 없음)");
                 return 0;
             }
-            
+
             if (!(dynamicDicField.GetValue(null) is IDictionary dynamicDic))
             {
                 Debug.Log($"{LOG_PREFIX} dynamicDic이 null (모드 아이템 없음)");
                 return 0;
             }
-            
+
             foreach (DictionaryEntry entry in dynamicDic)
             {
                 if (TryExtractItemData(entry.Value, itemType, out int typeID, out int maxStack))
@@ -267,7 +419,7 @@ namespace ItemReroll
                     count++;
                 }
             }
-            
+
             return count;
         }
 
@@ -275,43 +427,37 @@ namespace ItemReroll
         {
             typeID = 0;
             maxStack = 1;
-            
+
             if (entry == null) return false;
-            
+
             try
             {
                 var typeIDField = entry.GetType().GetField("typeID", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 if (typeIDField != null)
-                {
                     typeID = (int)typeIDField.GetValue(entry);
-                }
-                
+
                 if (typeID <= 0) return false;
-                
+
                 var prefabField = entry.GetType().GetField("prefab", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 if (prefabField == null) return false;
-                
+
                 var prefabObj = prefabField.GetValue(entry);
                 GameObject gameObject = null;
-                
-                if (prefabObj is Component component)
-                    gameObject = component.gameObject;
-                else if (prefabObj is GameObject go)
-                    gameObject = go;
-                
+
+                if (prefabObj is Component component) gameObject = component.gameObject;
+                else if (prefabObj is GameObject go) gameObject = go;
+
                 if (gameObject == null) return false;
-                
+
                 var itemComponent = gameObject.GetComponent(itemType);
                 if (itemComponent == null) return false;
-                
+
                 if (!IsValidItem(itemComponent, itemType)) return false;
-                
+
                 var maxStackProp = itemType.GetProperty("MaxStackCount");
                 if (maxStackProp != null && maxStackProp.GetValue(itemComponent) is int stack)
-                {
                     maxStack = stack;
-                }
-                
+
                 return true;
             }
             catch (Exception ex)
@@ -325,10 +471,10 @@ namespace ItemReroll
         {
             var iconProp = itemType.GetProperty("Icon");
             var nameProp = itemType.GetProperty("DisplayName");
-            
+
             var icon = iconProp?.GetValue(itemComponent) as Sprite;
             var displayName = nameProp?.GetValue(itemComponent) as string;
-            
+
             return icon != null && !string.IsNullOrEmpty(displayName);
         }
 
@@ -349,8 +495,8 @@ namespace ItemReroll
     internal class ItemFilter
     {
         private const string LOG_PREFIX = "[ItemReroll]";
-        
-        private static readonly string[] ContainerKeywords = 
+
+        private static readonly string[] ContainerKeywords =
         {
             "LootBox_EnemyDie",
             "LootBox_Natural",
@@ -364,61 +510,61 @@ namespace ItemReroll
         {
             var result = new FilterResult();
             int itemIndex = 0;
-            
+
             foreach (Item item in allItems)
             {
                 itemIndex++;
-                
+
                 if (!IsValidItem(item))
                 {
                     result.NullCount++;
                     continue;
                 }
-                
+
                 string itemName = item.gameObject.name;
                 int itemTypeID = item.TypeID;
-                
+
                 if (!HasParent(item))
                 {
                     result.GroundCount++;
                     continue;
                 }
-                
+
                 string parentName = item.transform.parent.name;
-                
+
                 if (IsPlayerItem(parentName))
                 {
                     result.PlayerCount++;
                     Debug.Log($"{LOG_PREFIX}   [{itemIndex}] [플레이어 제외] '{itemName}' (ID:{itemTypeID})");
                     continue;
                 }
-                
+
                 if (IsPickupItem(parentName))
                 {
                     result.GroundCount++;
                     continue;
                 }
-                
+
                 if (IsTombItem(parentName))
                 {
                     result.TombCount++;
                     Debug.Log($"{LOG_PREFIX}   [{itemIndex}] [플레이어 시체 제외] '{itemName}' (ID:{itemTypeID}) - {parentName}");
                     continue;
                 }
-                
+
                 if (IsNestedItem(item))
                 {
                     result.InventoryCount++;
                     Debug.Log($"{LOG_PREFIX}   [{itemIndex}] [아이템 내부 제외] '{itemName}' (ID:{itemTypeID}) - Parent Item: {parentName}");
                     continue;
                 }
-                
+
                 if (!HasInventory(item))
                 {
                     result.InventoryCount++;
                     continue;
                 }
-                
+
                 if (IsContainerItem(parentName))
                 {
                     result.ContainerItems.Add(item);
@@ -429,7 +575,7 @@ namespace ItemReroll
                     result.InventoryCount++;
                 }
             }
-            
+
             return result;
         }
 
@@ -440,7 +586,7 @@ namespace ItemReroll
         private bool IsTombItem(string parentName) => parentName.Contains("Tomb");
         private bool IsNestedItem(Item item) => item.transform.parent.GetComponent<Item>() != null;
         private bool HasInventory(Item item) => item.transform.parent.GetComponent<Inventory>() != null;
-        
+
         private bool IsContainerItem(string parentName)
         {
             return ContainerKeywords.Any(keyword => parentName.Contains(keyword));
@@ -468,26 +614,26 @@ namespace ItemReroll
                 Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] 원본 아이템이 null");
                 return false;
             }
-            
+
             try
             {
                 var inventory = GetInventory(originalItem);
                 if (inventory == null) return false;
-                
+
                 int index = GetItemIndex(inventory, originalItem);
                 if (index < 0) return false;
-                
+
                 var newItem = CreateRandomItem(database);
                 if (newItem == null) return false;
-                
+
                 SetRandomStack(newItem, database);
-                
+
                 string oldName = originalItem.DisplayName;
                 int oldID = originalItem.TypeID;
-                
+
                 if (!RemoveItem(inventory, index)) return false;
                 if (!AddItem(inventory, newItem, index)) return false;
-                
+
                 Debug.Log($"{LOG_PREFIX} [리롤 성공] {oldName}(ID:{oldID}) -> {newItem.DisplayName}(ID:{newItem.TypeID})");
                 return true;
             }
@@ -499,24 +645,24 @@ namespace ItemReroll
             }
         }
 
-        private Inventory GetInventory(Item item)
+        private Inventory? GetInventory(Item item)
         {
             if (item.transform.parent == null)
             {
                 Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] {item.name} - Parent 없음");
                 return null;
             }
-            
+
             string parentName = item.transform.parent.name;
             Debug.Log($"{LOG_PREFIX}   - Parent: {parentName}");
-            
+
             var inventory = item.transform.parent.GetComponent<Inventory>();
             if (inventory == null)
             {
                 Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] {item.name} - Parent에 Inventory 컴포넌트 없음 (Parent: {parentName})");
                 return null;
             }
-            
+
             Debug.Log($"{LOG_PREFIX}   - Inventory 발견: {inventory.name}");
             return inventory;
         }
@@ -529,49 +675,47 @@ namespace ItemReroll
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] {item.name} - GetIndex 메서드를 찾을 수 없음");
                 return -1;
             }
-            
+
             Debug.Log($"{LOG_PREFIX}   - GetIndex 메서드 호출 중...");
             int index = (int)getIndexMethod.Invoke(inventory, new object[] { item });
             Debug.Log($"{LOG_PREFIX}   - 인덱스: {index}");
-            
+
             if (index < 0)
             {
                 Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] {item.name} - 인덱스를 찾을 수 없음");
             }
-            
+
             return index;
         }
 
-        private Item CreateRandomItem(ItemDatabase database)
+        private Item? CreateRandomItem(ItemDatabase database)
         {
             int randomID = database.GetRandomID();
             Debug.Log($"{LOG_PREFIX}   - 랜덤 ID 선택: {randomID}");
-            
+
             var collectionType = ReflectionHelper.FindType("ItemAssetsCollection");
             if (collectionType == null)
             {
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] ItemAssetsCollection 타입을 찾을 수 없음");
                 return null;
             }
-            
+
             var instantiateMethod = collectionType.GetMethod("InstantiateSync", BindingFlags.Public | BindingFlags.Static);
             if (instantiateMethod == null)
             {
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] InstantiateSync 메서드를 찾을 수 없음");
                 return null;
             }
-            
+
             Debug.Log($"{LOG_PREFIX}   - InstantiateSync 호출 중...");
             var newItemObj = instantiateMethod.Invoke(null, new object[] { randomID });
             var newItem = newItemObj as Item;
-            
+
             Debug.Log($"{LOG_PREFIX}   - 새 아이템 생성: {(newItem != null ? newItem.name : "null")}");
-            
+
             if (newItem == null)
-            {
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] ID {randomID} 생성 실패");
-            }
-            
+
             return newItem;
         }
 
@@ -579,9 +723,9 @@ namespace ItemReroll
         {
             int maxStack = database.GetMaxStack(item.TypeID);
             if (maxStack <= 1) return;
-            
+
             int randomStack = UnityEngine.Random.Range(1, maxStack + 1);
-            
+
             var stackProp = item.GetType().GetProperty("Stack") ?? item.GetType().GetProperty("Quantity");
             if (stackProp != null && stackProp.CanWrite)
             {
@@ -593,54 +737,52 @@ namespace ItemReroll
         private bool RemoveItem(Inventory inventory, int index)
         {
             Debug.Log($"{LOG_PREFIX}   - 원본 아이템 제거 중...");
-            
+
             var removeAtMethod = inventory.GetType().GetMethod("RemoveAt");
             if (removeAtMethod == null)
             {
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] RemoveAt 메서드를 찾을 수 없음");
                 return false;
             }
-            
+
             object[] removeParams = new object[] { index, null };
             bool removed = (bool)removeAtMethod.Invoke(inventory, removeParams);
-            
+
             if (!removed)
             {
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] 아이템 제거 실패");
                 return false;
             }
-            
+
             Debug.Log($"{LOG_PREFIX}   - 원본 아이템 제거 완료");
-            
+
             var removedItem = removeParams[1] as Item;
             if (removedItem != null)
-            {
                 UnityEngine.Object.Destroy(removedItem.gameObject);
-            }
-            
+
             return true;
         }
 
         private bool AddItem(Inventory inventory, Item item, int index)
         {
             Debug.Log($"{LOG_PREFIX}   - AddAt 메서드 찾는 중...");
-            
+
             var addAtMethod = inventory.GetType().GetMethod("AddAt");
             if (addAtMethod == null)
             {
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] AddAt 메서드를 찾을 수 없음");
                 return false;
             }
-            
+
             Debug.Log($"{LOG_PREFIX}   - AddAt 호출: 인덱스={index}, 새 아이템={item.name}");
             bool added = (bool)addAtMethod.Invoke(inventory, new object[] { item, index });
-            
+
             if (!added)
             {
                 Debug.LogError($"{LOG_PREFIX} [리롤 실패] 새 아이템 추가 실패");
                 return false;
             }
-            
+
             Debug.Log($"{LOG_PREFIX}   - AddAt 완료");
             return true;
         }
@@ -657,14 +799,8 @@ namespace ItemReroll
 
         private static Type[] GetTypesFromAssembly(Assembly assembly)
         {
-            try
-            {
-                return assembly.GetTypes();
-            }
-            catch
-            {
-                return Array.Empty<Type>();
-            }
+            try { return assembly.GetTypes(); }
+            catch { return Array.Empty<Type>(); }
         }
     }
 }
