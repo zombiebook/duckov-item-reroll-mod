@@ -37,10 +37,15 @@ namespace ItemReroll
 
         // 비용(RefreshStockPrice 기반)
         private const string PREFS_COST = "ItemReroll.RerollCost";
+        // 지난 리롤 시각을 저장하는 키. 일정 시간 후 비용을 초기화할 때 사용됩니다.
+        private const string PREFS_LAST_REROLL_TIME = "ItemReroll.LastRerollTime";
         private long _rerollCostBase = 100;      // LuckyBox 없을 때 백업 기본값
         private long _rerollCostStep = 1000;       // 성공 시 증가 폭 (CFG)
         private long _rerollCostCurrent = 100;   // 현재 비용
         private bool _useCost = true;
+
+        // 비용 초기화를 위한 지연(초). 마지막 리롤 이후 이 시간이 지나면 비용이 기본값으로 되돌아갑니다.
+        private float _costResetDelaySeconds = 60f;
 
         // LuckyBox SettingManager 캐시
         private object _lbSettingMgr;      // DuckovLuckyBox.Core.Settings.SettingManager.Instance
@@ -74,6 +79,8 @@ namespace ItemReroll
 
             // 현재 비용 초기화 (PlayerPrefs → base 최소 보정)
             _rerollCostCurrent = Math.Max(_rerollCostBase, PlayerPrefs.GetInt(PREFS_COST, (int)_rerollCostBase));
+            // 게임 시작 시에도 비용 초기화 체크를 수행합니다.
+            CheckResetCost();
             PlayerPrefs.SetInt(PREFS_COST, (int)_rerollCostCurrent);
             PlayerPrefs.Save();
 
@@ -89,6 +96,8 @@ namespace ItemReroll
 
         private void Update()
         {
+            // 리롤 비용 자동 초기화 체크
+            CheckResetCost();
             // ── 키 리바인 토글: Insert ───────────────────────────────
             if (!_waitingRebind && Input.GetKeyDown(KeyCode.Insert))
             {
@@ -206,6 +215,12 @@ namespace ItemReroll
             // 성공 시 다음 비용 증가
             if (_useCost && successCount > 0)
             {
+                // 최근 리롤 시각 업데이트 (비용 초기화 타이머)
+                try
+                {
+                    PlayerPrefs.SetString(PREFS_LAST_REROLL_TIME, System.DateTime.UtcNow.Ticks.ToString());
+                }
+                catch { /* ignore */ }
                 try
                 {
                     checked { _rerollCostCurrent = Math.Max(_rerollCostBase, _rerollCostCurrent + _rerollCostStep); }
@@ -244,6 +259,37 @@ namespace ItemReroll
             {
                 Debug.Log($"{LOG_PREFIX} {message}");
                 Debug.Log($"{LOG_PREFIX} ========================================");
+            }
+        }
+
+        /// <summary>
+        /// 마지막 리롤 이후 경과 시간을 검사하고, 설정된 지연(_costResetDelaySeconds) 이상이면
+        /// 현재 리롤 비용을 기본값(_rerollCostBase)으로 초기화합니다.
+        /// </summary>
+        private void CheckResetCost()
+        {
+            try
+            {
+                string lastTicksStr = PlayerPrefs.GetString(PREFS_LAST_REROLL_TIME, string.Empty);
+                if (!string.IsNullOrEmpty(lastTicksStr) && long.TryParse(lastTicksStr, out long ticks))
+                {
+                    System.DateTime lastTime = new System.DateTime(ticks, System.DateTimeKind.Utc);
+                    double elapsedSeconds = (System.DateTime.UtcNow - lastTime).TotalSeconds;
+                    // 비용이 증가해 있는 경우에만 초기화 수행
+                    if (elapsedSeconds >= _costResetDelaySeconds && _rerollCostCurrent > _rerollCostBase)
+                    {
+                        _rerollCostCurrent = _rerollCostBase;
+                        PlayerPrefs.SetInt(PREFS_COST, (int)_rerollCostCurrent);
+                        // 초기화 후 타임스탬프 삭제하여 반복 초기화를 방지
+                        PlayerPrefs.DeleteKey(PREFS_LAST_REROLL_TIME);
+                        PlayerPrefs.Save();
+                        Debug.Log($"{LOG_PREFIX} 비용 초기화: 마지막 리롤 후 {elapsedSeconds:F1}초 경과");
+                    }
+                }
+            }
+            catch
+            {
+                // 예외 발생 시 무시합니다.
             }
         }
 
