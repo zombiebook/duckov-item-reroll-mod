@@ -1,3 +1,4 @@
+// ModBehaviour.cs
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -10,17 +11,48 @@ namespace ItemReroll
 {
     public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
-        // ── 사용자 편집용 CFG ───────────────────────────────
-        private string? _cfgPath; // e.g., <persistentDataPath>/ItemReroll.cfg
-        private const string CFG_HEADER = "# ItemReroll config (editable)\n# Keys: RerollKey=F9\n";
-        // ────────────────────────────────────────────────────
+        // ── CFG (편집 가능) ───────────────────────────────────────
+        private string _cfgPath; // <persistentDataPath>/ItemReroll.cfg
+        private const string CFG_HEADER =
+            "# ItemReroll config (editable)\n" +
+            "# Keys:\n" +
+            "#   RerollKey=F9           ; 리롤 실행 키 (Unity KeyCode)\n" +
+            "#   CostStep=1000           ; 리롤 성공 시 증가 비용(선형)\n" +
+            "#   UseCost=1              ; 1=비용 사용, 0=비용 미사용(디버그)\n" +
+            "#   DebugCurrency=0        ; 1=통화 바인딩 상세 로그 출력\n" +
+            "#   CurrencyHintType=      ; (선택) 통화 컴포넌트/매니저 타입명\n" +
+            "#   CurrencyHintMember=    ; (선택) 돈 필드/프로퍼티명\n" +
+            "#   CurrencyGameObject=    ; (선택) 돈이 붙은 GO 이름(부분일치)\n" +
+            "#   CurrencyMethodGet=     ; (선택) 돈 읽기 메서드명(int/float)\n" +
+            "#   CurrencyMethodSet=     ; (선택) 돈 설정 메서드명(int/float 1개 인자)\n" +
+            "#   CurrencyMethodAdd=     ; (선택) 돈 증감 메서드명(int/float 1개 인자, -지출)\n";
+        // ─────────────────────────────────────────────────────────
 
         private const string LOG_PREFIX = "[ItemReroll]";
 
-        // 커스텀 가능한 리롤 키 (기본 F9) + 리바인 상태
+        // 리롤 키 및 리바인 (Insert로 변경)
         private KeyCode _rerollKey = KeyCode.F9;
         private const string PREFS_REROLL_KEY = "ItemReroll.RerollKey";
-        private bool _waitingRebind = false; // 키 변경 대기 상태
+        private bool _waitingRebind = false;
+
+        // 비용(RefreshStockPrice 기반)
+        private const string PREFS_COST = "ItemReroll.RerollCost";
+        private long _rerollCostBase = 100;      // LuckyBox 없을 때 백업 기본값
+        private long _rerollCostStep = 1000;       // 성공 시 증가 폭 (CFG)
+        private long _rerollCostCurrent = 100;   // 현재 비용
+        private bool _useCost = true;
+
+        // LuckyBox SettingManager 캐시
+        private object _lbSettingMgr;      // DuckovLuckyBox.Core.Settings.SettingManager.Instance
+        private object _lbRefreshSetting;  // SettingItem: RefreshStockPrice
+        private MethodInfo _refreshGetAsLong; // SettingItem.GetAsLong (이벤트 핸들러에서 사용)
+
+        // 소비 텍스트 HUD (가벼운 OnGUI)
+        private int _lastSpentAmount = 0;
+        private float _lastSpendShowUntil = 0f;
+
+        // 통화 브릿지(힌트/휴리스틱)
+        private readonly CurrencyBridge _currency = new CurrencyBridge();
 
         private readonly ItemDatabase _itemDatabase = new ItemDatabase();
         private readonly ItemFilter _itemFilter = new ItemFilter();
@@ -30,14 +62,22 @@ namespace ItemReroll
         private void Awake()
         {
             LogSection("모드 초기화 시작");
-            Debug.Log($"{LOG_PREFIX} 리롤 대상: 컨테이너 아이템 (적 드롭, 자연 파밍 컨테이너)");
 
             _itemDatabase.LoadFromGame();
 
-            // CFG 경로 준비 & 로드 (없으면 생성), PlayerPrefs 보조 로드
             _cfgPath = UnityEngine.Application.persistentDataPath + "/ItemReroll.cfg";
-            LoadConfig();           // CFG에서 키 우선 로드
-            LoadRerollKey();        // PlayerPrefs 값도 있으면 보조 로드 (CFG 우선)
+            LoadConfig();        // CFG (키/증가폭/통화힌트/UseCost/Debug)
+            LoadRerollKey();     // PlayerPrefs 보조
+
+            // LuckyBox의 RefreshStockPrice를 리롤 기본 비용으로 사용 (없으면 백업값 유지)
+            TryLoadPriceFromLuckyBox();
+
+            // 현재 비용 초기화 (PlayerPrefs → base 최소 보정)
+            _rerollCostCurrent = Math.Max(_rerollCostBase, PlayerPrefs.GetInt(PREFS_COST, (int)_rerollCostBase));
+            PlayerPrefs.SetInt(PREFS_COST, (int)_rerollCostCurrent);
+            PlayerPrefs.Save();
+
+            _currency.WarmUp();
 
             Debug.Log($"{LOG_PREFIX} 유효한 아이템 ID: {_itemDatabase.Count}개");
             if (_itemDatabase.Count > 0)
@@ -49,17 +89,14 @@ namespace ItemReroll
 
         private void Update()
         {
-            // ── 키 리바인 토글: Insert ────────────────────────────────────────────
-            // 대기 중이 아닐 때만 토글 ON; Insert를 눌러 리바인 시작
+            // ── 키 리바인 토글: Insert ───────────────────────────────
             if (!_waitingRebind && Input.GetKeyDown(KeyCode.Insert))
             {
                 _waitingRebind = true;
                 Debug.Log("[ItemReroll] 키 변경 대기... 아무 키나 누르면 저장 (Esc로 취소)");
             }
-
             if (_waitingRebind)
             {
-                // Esc로 취소 (이 키는 바인딩 대상에서 제외)
                 if (Input.GetKeyDown(KeyCode.Escape))
                 {
                     _waitingRebind = false;
@@ -67,23 +104,21 @@ namespace ItemReroll
                 }
                 else
                 {
-                    // 다음에 눌린 아무 키나 새 리롤 키로 저장 (토글 키/취소 키 제외)
                     foreach (KeyCode kc in Enum.GetValues(typeof(KeyCode)))
                     {
-                        // None/Escape/Insert 제외 (Insert는 리바인 토글 키)
                         if (kc == KeyCode.None || kc == KeyCode.Escape || kc == KeyCode.Insert) continue;
                         if (Input.GetKeyDown(kc))
                         {
                             _waitingRebind = false;
-                            SetRerollKey(kc.ToString()); // 저장 & 적용 (CFG + PlayerPrefs)
+                            SetRerollKey(kc.ToString());
                             break;
                         }
                     }
                 }
             }
-            // ───────────────────────────────────────────────────────────────────────
+            // ─────────────────────────────────────────────────────────
 
-            // 리롤 실행 키
+            // 리롤 실행
             if (Input.GetKeyDown(_rerollKey))
             {
                 if (_isRerolling)
@@ -91,9 +126,23 @@ namespace ItemReroll
                     Debug.LogWarning($"{LOG_PREFIX} 이미 리롤이 진행 중입니다. 대기 중...");
                     return;
                 }
-
                 LogSection($"{_rerollKey} 키 입력 감지! 리롤 시작...");
                 StartCoroutine(PerformReroll());
+            }
+        }
+
+        private void OnGUI()
+        {
+            if (Time.time <= _lastSpendShowUntil && _lastSpentAmount > 0)
+            {
+                var r = new Rect(Screen.width - 220, 20, 200, 30);
+                GUIStyle s = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleRight,
+                    fontSize = 18,
+                    fontStyle = FontStyle.Bold
+                };
+                GUI.Label(r, $"-{_lastSpentAmount}", s);
             }
         }
 
@@ -124,6 +173,24 @@ namespace ItemReroll
                 yield break;
             }
 
+            // ── 돈 확인/차감 (EconomyManager 우선 → 폴백) ─────────────
+            if (_useCost)
+            {
+                long costNow = Math.Max(_rerollCostBase, _rerollCostCurrent);
+
+                if (!TryPay(costNow))
+                {
+                    Debug.Log($"{LOG_PREFIX} 결제 실패 또는 잔액 부족. 필요:{costNow}");
+                    _isRerolling = false;
+                    yield break;
+                }
+
+                _lastSpentAmount = (int)costNow;
+                _lastSpendShowUntil = Time.time + 2.5f;
+                Debug.Log($"{LOG_PREFIX} 비용 차감: -{costNow}");
+            }
+            // ───────────────────────────────────────────────────────
+
             Debug.Log($"{LOG_PREFIX} [3단계] {containerItems.Count}개 컨테이너 아이템 리롤 시작...");
 
             int successCount = 0;
@@ -131,14 +198,23 @@ namespace ItemReroll
 
             for (int i = 0; i < containerItems.Count; i++)
             {
-                Debug.Log($"{LOG_PREFIX} [{i + 1}/{containerItems.Count}] 아이템 처리 중...");
-
                 bool success = _itemReroller.RerollItem(containerItems[i], _itemDatabase);
-
-                if (success) successCount++;
-                else failCount++;
-
+                if (success) successCount++; else failCount++;
                 yield return null;
+            }
+
+            // 성공 시 다음 비용 증가
+            if (_useCost && successCount > 0)
+            {
+                try
+                {
+                    checked { _rerollCostCurrent = Math.Max(_rerollCostBase, _rerollCostCurrent + _rerollCostStep); }
+                }
+                catch { _rerollCostCurrent = Math.Max(_rerollCostBase, int.MaxValue); }
+
+                PlayerPrefs.SetInt(PREFS_COST, (int)_rerollCostCurrent);
+                PlayerPrefs.Save();
+                Debug.Log($"{LOG_PREFIX} 리롤 성공({successCount}). 다음 비용: {_rerollCostCurrent} (+{_rerollCostStep})");
             }
 
             ShowResults(successCount, failCount);
@@ -149,23 +225,8 @@ namespace ItemReroll
 
         private List<Item> FindContainerItems()
         {
-            Debug.Log($"{LOG_PREFIX} [1단계] 월드의 모든 아이템 탐색 중...");
-
             Item[] allItems = UnityEngine.Object.FindObjectsOfType<Item>();
-            Debug.Log($"{LOG_PREFIX} 발견된 총 아이템 수: {allItems.Length}개");
-
-            Debug.Log($"{LOG_PREFIX} [2단계] 아이템 필터링 중... (컨테이너 아이템만)");
-
             var filterResult = _itemFilter.FilterContainerItems(allItems);
-
-            Debug.Log($"{LOG_PREFIX} 필터링 결과:");
-            Debug.Log($"{LOG_PREFIX}   - 리롤 대상: {filterResult.ContainerItems.Count}개");
-            Debug.Log($"{LOG_PREFIX}   - 플레이어: {filterResult.PlayerCount}개");
-            Debug.Log($"{LOG_PREFIX}   - 플레이어 시체: {filterResult.TombCount}개");
-            Debug.Log($"{LOG_PREFIX}   - 바닥: {filterResult.GroundCount}개");
-            Debug.Log($"{LOG_PREFIX}   - 인벤토리: {filterResult.InventoryCount}개");
-            Debug.Log($"{LOG_PREFIX}   - null/무효: {filterResult.NullCount}개");
-
             return filterResult.ContainerItems;
         }
 
@@ -174,13 +235,6 @@ namespace ItemReroll
             Debug.Log($"{LOG_PREFIX} [4단계] 리롤 완료!");
             Debug.Log($"{LOG_PREFIX}   - 성공: {successCount}개");
             Debug.Log($"{LOG_PREFIX}   - 실패: {failCount}개");
-
-            string message = successCount > 0
-                ? $"{successCount}개 컨테이너 아이템 리롤!"
-                : "리롤할 컨테이너 아이템이 없습니다.";
-
-            LogSection(message);
-            Debug.Log($"[알림] {message}");
         }
 
         private void LogSection(string message)
@@ -193,6 +247,193 @@ namespace ItemReroll
             }
         }
 
+        // ─────────── LuckyBox RefreshStockPrice 연동 ───────────
+        private void TryLoadPriceFromLuckyBox()
+        {
+            try
+            {
+                // SettingManager
+                var smType = FindTypeAnyAssembly("DuckovLuckyBox.Core.Settings.SettingManager") ??
+                             Type.GetType("DuckovLuckyBox.Core.Settings.SettingManager, DuckovLuckyBox");
+                if (smType == null) return;
+
+                var instProp = smType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                _lbSettingMgr = instProp?.GetValue(null);
+                if (_lbSettingMgr == null) return;
+
+                // RefreshStockPrice
+                var refreshProp = smType.GetProperty("RefreshStockPrice", BindingFlags.Public | BindingFlags.Instance);
+                _lbRefreshSetting = refreshProp?.GetValue(_lbSettingMgr);
+                if (_lbRefreshSetting == null) return;
+
+                var getAsLong = _lbRefreshSetting.GetType().GetMethod("GetAsLong", BindingFlags.Public | BindingFlags.Instance);
+                if (getAsLong == null) return;
+
+                var baseCost = (long)getAsLong.Invoke(_lbRefreshSetting, null);
+                if (baseCost > 0)
+                {
+                    _rerollCostBase = baseCost;
+                    _rerollCostCurrent = Math.Max(_rerollCostCurrent, _rerollCostBase);
+                    Debug.Log($"[ItemReroll] LuckyBox RefreshStockPrice 적용: base={_rerollCostBase}, current={_rerollCostCurrent}");
+                }
+
+                // 값 변경 자동 반영(가능 시) — 로컬 함수 대신 인스턴스 메서드로 안전하게 구독
+                var evt = _lbRefreshSetting.GetType().GetEvent("OnChanged", BindingFlags.Public | BindingFlags.Instance);
+                if (evt != null)
+                {
+                    _refreshGetAsLong = getAsLong; // 핸들러에서 사용할 메서드 캐시
+                    TrySubscribeRefreshChanged(_lbRefreshSetting, evt);
+                }
+            }
+            catch { /* ignore */ }
+        }
+
+        // 이벤트 구독(시그니처가 EventHandler가 아닐 수도 있으니 CreateDelegate를 느슨하게 시도)
+        private void TrySubscribeRefreshChanged(object setting, EventInfo evt)
+        {
+            try
+            {
+                var mi = typeof(ModBehaviour).GetMethod(nameof(OnRefreshChanged), BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null)
+                         ?? typeof(ModBehaviour).GetMethod(nameof(OnRefreshChanged), BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(object), typeof(EventArgs) }, null);
+                if (mi == null) return;
+
+                var del = Delegate.CreateDelegate(evt.EventHandlerType, this, mi, throwOnBindFailure: false);
+                if (del != null)
+                {
+                    evt.AddEventHandler(setting, del);
+                    Debug.Log("[ItemReroll] RefreshStockPrice.OnChanged 구독 성공");
+                }
+                else
+                {
+                    Debug.Log("[ItemReroll] RefreshStockPrice.OnChanged 델리게이트 바인딩 실패 (시그니처 불일치 가능)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.Log($"[ItemReroll] OnChanged 구독 실패: {ex.Message}");
+            }
+        }
+
+        // 이벤트 핸들러(매개변수 0 버전)
+        private void OnRefreshChanged()
+        {
+            ApplyRefreshPriceFromSetting();
+        }
+
+        // 이벤트 핸들러(매개변수 2 버전: object, EventArgs)
+        private void OnRefreshChanged(object sender, EventArgs e)
+        {
+            ApplyRefreshPriceFromSetting();
+        }
+
+        private void ApplyRefreshPriceFromSetting()
+        {
+            try
+            {
+                if (_lbRefreshSetting != null && _refreshGetAsLong != null)
+                {
+                    var v = (long)_refreshGetAsLong.Invoke(_lbRefreshSetting, null);
+                    if (v > 0)
+                    {
+                        _rerollCostBase = v;
+                        if (_rerollCostCurrent < _rerollCostBase)
+                            _rerollCostCurrent = _rerollCostBase;
+
+                        Debug.Log($"[ItemReroll] RefreshStockPrice 변경 반영: base={_rerollCostBase}, current={_rerollCostCurrent}");
+                    }
+                }
+            }
+            catch { /* ignore */ }
+        }
+
+        // EconomyManager.Pay → 실패 시 CurrencyBridge 폴백
+        private bool TryPay(long amount)
+        {
+            if (amount <= 0) return true;
+
+            // 1) EconomyManager.Pay(Cost, bool, bool)
+            try
+            {
+                var econType = FindTypeAnyAssembly("Duckov.Economy.EconomyManager") ??
+                               Type.GetType("Duckov.Economy.EconomyManager, DuckovLuckyBox");
+                var costType = FindTypeAnyAssembly("Duckov.Economy.Cost") ??
+                               Type.GetType("Duckov.Economy.Cost, DuckovLuckyBox");
+
+                if (econType != null && costType != null)
+                {
+                    var cost = Activator.CreateInstance(costType, new object[] { amount });
+                    var pay = econType.GetMethod("Pay", BindingFlags.Public | BindingFlags.Static);
+                    if (pay != null)
+                    {
+                        bool ok = (bool)pay.Invoke(null, new object[] { cost, true, true });
+                        if (!ok) PushNotEnoughMoneyToast(amount); // 토스트
+                        return ok;
+                    }
+                }
+            }
+            catch
+            {
+                // 폴백으로
+            }
+
+            // 2) 폴백: CurrencyBridge
+            if (!_currency.TryGetMoney(out var money)) return false;
+            if (money < amount) { PushNotEnoughMoneyToast(amount); return false; }
+            if (_currency.TrySpendMoney((int)amount)) return true;
+            return _currency.TrySetMoney(money - (int)amount);
+        }
+
+        private void PushNotEnoughMoneyToast(long amount)
+        {
+            try
+            {
+                // Localization: SodaCraft.Localizations.LocalizationManager.ToPlainText(Localizations.I18n.NotEnoughMoneyFormatKey)
+                string message = null;
+
+                var i18nType = FindTypeAnyAssembly("SodaCraft.Localizations.Localizations+I18n");
+                var locMgrType = FindTypeAnyAssembly("SodaCraft.Localizations.LocalizationManager");
+                if (i18nType != null && locMgrType != null)
+                {
+                    var keyField = i18nType.GetField("NotEnoughMoneyFormatKey", BindingFlags.Public | BindingFlags.Static);
+                    var keyVal = keyField?.GetValue(null) as string;
+                    if (!string.IsNullOrEmpty(keyVal))
+                    {
+                        var toPlain = locMgrType.GetMethod("ToPlainText", BindingFlags.Public | BindingFlags.Static);
+                        var txt = toPlain?.Invoke(null, new object[] { keyVal }) as string;
+                        if (!string.IsNullOrEmpty(txt)) message = txt.Replace("{price}", amount.ToString());
+                    }
+                }
+
+                if (string.IsNullOrEmpty(message))
+                    message = $"Not enough money ({amount})";
+
+                // NotificationText.Push(message)
+                var notiType = FindTypeAnyAssembly("Duckov.UI.NotificationText") ??
+                               Type.GetType("Duckov.UI.NotificationText, DuckovLuckyBox");
+                var push = notiType?.GetMethod("Push", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+                push?.Invoke(null, new object[] { message });
+            }
+            catch { /* ignore */ }
+        }
+
+        private static Type FindTypeAnyAssembly(string fullName)
+        {
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try
+                    {
+                        var t = asm.GetType(fullName, false);
+                        if (t != null) return t;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return null;
+        }
+
         // ───────────────────── CFG: Load / Save ─────────────────────
         private void LoadConfig()
         {
@@ -201,35 +442,73 @@ namespace ItemReroll
                 if (string.IsNullOrEmpty(_cfgPath))
                     _cfgPath = UnityEngine.Application.persistentDataPath + "/ItemReroll.cfg";
 
-                // 파일 없으면 생성(기본값 F9)
+                // 파일 없으면 생성
                 if (!global::System.IO.File.Exists(_cfgPath))
                 {
-                    var defaultText = CFG_HEADER + "RerollKey=F9\n";
+                    var defaultText = CFG_HEADER +
+                                      "RerollKey=F9\n" +
+                                      "CostStep=1000\n" +
+                                      "UseCost=1\n" +
+                                      "DebugCurrency=0\n" +
+                                      "# CurrencyHintType=\n" +
+                                      "# CurrencyHintMember=\n" +
+                                      "# CurrencyGameObject=\n" +
+                                      "# CurrencyMethodGet=\n" +
+                                      "# CurrencyMethodSet=\n" +
+                                      "# CurrencyMethodAdd=\n";
                     EnsureDirExists(_cfgPath);
                     global::System.IO.File.WriteAllText(_cfgPath, defaultText);
                     _rerollKey = KeyCode.F9;
+                    _rerollCostStep = 1000;
+                    _useCost = true;
                     return;
                 }
 
-                // 파싱
+                string hintType = null, hintMember = null, goName = null, mGet = null, mSet = null, mAdd = null;
+                int debugCurrency = 0;
+
                 var lines = global::System.IO.File.ReadAllLines(_cfgPath);
                 foreach (var raw in lines)
                 {
-                    var line = raw?.Trim();
+                    var line = raw == null ? null : raw.Trim();
                     if (string.IsNullOrEmpty(line)) continue;
                     if (line.StartsWith("#")) continue;
                     var idx = line.IndexOf('=');
                     if (idx <= 0) continue;
                     var key = line.Substring(0, idx).Trim();
                     var val = line.Substring(idx + 1).Trim();
+
                     if (string.Equals(key, "RerollKey", StringComparison.OrdinalIgnoreCase))
                     {
                         if (Enum.TryParse<KeyCode>(val, true, out var parsed) &&
                             parsed != KeyCode.None && parsed != KeyCode.Escape)
                             _rerollKey = parsed;
                     }
+                    else if (string.Equals(key, "CostStep", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(val, out var cs) && cs >= 0)
+                            _rerollCostStep = cs;
+                    }
+                    else if (string.Equals(key, "UseCost", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _useCost = (val == "1" || val.Equals("true", StringComparison.OrdinalIgnoreCase));
+                    }
+                    else if (string.Equals(key, "DebugCurrency", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int.TryParse(val, out debugCurrency);
+                    }
+                    else if (string.Equals(key, "CurrencyHintType", StringComparison.OrdinalIgnoreCase))   hintType = string.IsNullOrWhiteSpace(val) ? null : val;
+                    else if (string.Equals(key, "CurrencyHintMember", StringComparison.OrdinalIgnoreCase)) hintMember = string.IsNullOrWhiteSpace(val) ? null : val;
+                    else if (string.Equals(key, "CurrencyGameObject", StringComparison.OrdinalIgnoreCase)) goName = string.IsNullOrWhiteSpace(val) ? null : val;
+                    else if (string.Equals(key, "CurrencyMethodGet", StringComparison.OrdinalIgnoreCase))  mGet = string.IsNullOrWhiteSpace(val) ? null : val;
+                    else if (string.Equals(key, "CurrencyMethodSet", StringComparison.OrdinalIgnoreCase))  mSet = string.IsNullOrWhiteSpace(val) ? null : val;
+                    else if (string.Equals(key, "CurrencyMethodAdd", StringComparison.OrdinalIgnoreCase))  mAdd = string.IsNullOrWhiteSpace(val) ? null : val;
                 }
-                Debug.Log($"[ItemReroll] (CFG) 리롤 키: {_rerollKey}  path={_cfgPath}");
+
+                // 통화 브릿지 힌트 주입
+                _currency.SetHints(hintType, hintMember, goName, mGet, mSet, mAdd, debugCurrency != 0);
+
+                Debug.Log($"[ItemReroll] (CFG) 키:{_rerollKey} step:{_rerollCostStep} useCost:{_useCost}");
             }
             catch (Exception ex)
             {
@@ -245,7 +524,11 @@ namespace ItemReroll
                     _cfgPath = UnityEngine.Application.persistentDataPath + "/ItemReroll.cfg";
 
                 EnsureDirExists(_cfgPath);
-                var text = CFG_HEADER + $"RerollKey={_rerollKey}\n";
+                var text = CFG_HEADER +
+                           $"RerollKey={_rerollKey}\n" +
+                           $"CostStep={_rerollCostStep}\n" +
+                           $"UseCost={( _useCost ? 1 : 0)}\n" +
+                           $"DebugCurrency={( _currency.DebugLog ? 1 : 0)}\n";
                 global::System.IO.File.WriteAllText(_cfgPath, text);
                 Debug.Log($"[ItemReroll] (CFG) 저장 완료: {_cfgPath}");
             }
@@ -255,7 +538,6 @@ namespace ItemReroll
             }
         }
 
-        // 디렉터리 없으면 생성 (System.IO using 없이)
         private static void EnsureDirExists(string filePath)
         {
             try
@@ -276,14 +558,12 @@ namespace ItemReroll
                 if (Enum.TryParse<KeyCode>(saved, true, out var key) &&
                     key != KeyCode.None && key != KeyCode.Escape)
                 {
-                    // CFG에서 이미 읽은 값이 우선. 기본값 상태면 PlayerPrefs 적용.
                     if (_rerollKey == KeyCode.F9) _rerollKey = key;
                 }
             }
             Debug.Log($"[ItemReroll] 리롤 키: {_rerollKey}");
         }
 
-        // 콘솔/리바인 모드에서 공용으로 호출 가능 (예: SetRerollKey("F7"))
         public void SetRerollKey(string keyName)
         {
             if (Enum.TryParse<KeyCode>(keyName, true, out var key) &&
@@ -292,8 +572,8 @@ namespace ItemReroll
                 _rerollKey = key;
                 PlayerPrefs.SetString(PREFS_REROLL_KEY, key.ToString());
                 PlayerPrefs.Save();
-                SaveConfig(); // CFG에도 반영
-                Debug.Log($"[ItemReroll] 리롤 키가 '{_rerollKey}' 로 저장되었습니다.");
+                SaveConfig();
+                Debug.Log($"[ItemReroll] 리롤 키가 '{(_rerollKey)}' 로 저장되었습니다.");
             }
             else
             {
@@ -302,10 +582,9 @@ namespace ItemReroll
         }
     }
 
+    // ───────────────────────── 아이템 DB ─────────────────────────
     internal class ItemDatabase
     {
-        private const string LOG_PREFIX = "[ItemReroll]";
-
         private readonly List<int> _validItemIDs = new List<int>();
         private readonly Dictionary<int, int> _stackCounts = new Dictionary<int, int>();
 
@@ -315,41 +594,26 @@ namespace ItemReroll
 
         public void LoadFromGame()
         {
-            Debug.Log($"{LOG_PREFIX} 게임에서 아이템 ID 동적 로딩 중...");
-
             try
             {
                 var collectionType = ReflectionHelper.FindType("ItemAssetsCollection");
-                if (collectionType == null)
-                {
-                    Debug.LogError($"{LOG_PREFIX} ItemAssetsCollection 타입을 찾을 수 없습니다");
-                    return;
-                }
+                if (collectionType == null) return;
 
                 var collection = Resources.LoadAll<ScriptableObject>("")
                     .FirstOrDefault(obj => collectionType.IsAssignableFrom(obj.GetType()));
-
-                if (collection == null)
-                {
-                    Debug.LogError($"{LOG_PREFIX} ItemAssetsCollection 인스턴스를 찾을 수 없습니다");
-                    return;
-                }
+                if (collection == null) return;
 
                 var itemType = ReflectionHelper.FindType("ItemStatsSystem.Item");
-                if (itemType == null)
-                {
-                    Debug.LogError($"{LOG_PREFIX} Item 타입을 찾을 수 없습니다");
-                    return;
-                }
+                if (itemType == null) return;
 
                 int vanillaCount = LoadVanillaItems(collectionType, collection, itemType);
                 int moddedCount = LoadModdedItems(collectionType, itemType);
 
-                Debug.Log($"{LOG_PREFIX} 로딩 완료: 바닐라 {vanillaCount}개, 모드 {moddedCount}개, 총 {Count}개");
+                Debug.Log($"[ItemReroll] 로딩 완료: 바닐라 {vanillaCount}개, 모드 {moddedCount}개, 총 {Count}개");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"{LOG_PREFIX} 아이템 로딩 실패: {ex.Message}");
+                Debug.LogError($"[ItemReroll] 아이템 로딩 실패: {ex.Message}");
             }
         }
 
@@ -368,19 +632,11 @@ namespace ItemReroll
         private int LoadVanillaItems(Type collectionType, ScriptableObject collection, Type itemType)
         {
             int count = 0;
-
             var entriesField = collectionType.GetField("entries", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (entriesField == null)
-            {
-                Debug.LogWarning($"{LOG_PREFIX} entries 필드를 찾을 수 없습니다");
-                return 0;
-            }
+            if (entriesField == null) return 0;
 
-            if (!(entriesField.GetValue(collection) is IList entries))
-            {
-                Debug.LogWarning($"{LOG_PREFIX} entries가 null입니다");
-                return 0;
-            }
+            var entries = entriesField.GetValue(collection) as System.Collections.IList;
+            if (entries == null) return 0;
 
             foreach (var entry in entries)
             {
@@ -390,28 +646,19 @@ namespace ItemReroll
                     count++;
                 }
             }
-
             return count;
         }
 
         private int LoadModdedItems(Type collectionType, Type itemType)
         {
             int count = 0;
-
             var dynamicDicField = collectionType.GetField("dynamicDic", BindingFlags.Static | BindingFlags.NonPublic);
-            if (dynamicDicField == null)
-            {
-                Debug.Log($"{LOG_PREFIX} dynamicDic 필드 없음 (모드 아이템 없음)");
-                return 0;
-            }
+            if (dynamicDicField == null) return 0;
 
-            if (!(dynamicDicField.GetValue(null) is IDictionary dynamicDic))
-            {
-                Debug.Log($"{LOG_PREFIX} dynamicDic이 null (모드 아이템 없음)");
-                return 0;
-            }
+            var dynamicDic = dynamicDicField.GetValue(null) as System.Collections.IDictionary;
+            if (dynamicDic == null) return 0;
 
-            foreach (DictionaryEntry entry in dynamicDic)
+            foreach (System.Collections.DictionaryEntry entry in dynamicDic)
             {
                 if (TryExtractItemData(entry.Value, itemType, out int typeID, out int maxStack))
                 {
@@ -419,7 +666,6 @@ namespace ItemReroll
                     count++;
                 }
             }
-
             return count;
         }
 
@@ -460,9 +706,8 @@ namespace ItemReroll
 
                 return true;
             }
-            catch (Exception ex)
+            catch
             {
-                Debug.LogWarning($"{LOG_PREFIX} 항목 처리 실패: {ex.Message}");
                 return false;
             }
         }
@@ -492,10 +737,9 @@ namespace ItemReroll
         }
     }
 
+    // ───────────────────────── 필터 ─────────────────────────
     internal class ItemFilter
     {
-        private const string LOG_PREFIX = "[ItemReroll]";
-
         private static readonly string[] ContainerKeywords =
         {
             "LootBox_EnemyDie",
@@ -509,83 +753,25 @@ namespace ItemReroll
         public FilterResult FilterContainerItems(Item[] allItems)
         {
             var result = new FilterResult();
-            int itemIndex = 0;
-
             foreach (Item item in allItems)
             {
-                itemIndex++;
-
-                if (!IsValidItem(item))
-                {
-                    result.NullCount++;
-                    continue;
-                }
-
-                string itemName = item.gameObject.name;
-                int itemTypeID = item.TypeID;
-
-                if (!HasParent(item))
-                {
-                    result.GroundCount++;
-                    continue;
-                }
+                if (item == null || item.gameObject == null) { result.NullCount++; continue; }
+                if (item.transform.parent == null) { result.GroundCount++; continue; }
 
                 string parentName = item.transform.parent.name;
+                if (string.IsNullOrEmpty(parentName)) { result.NullCount++; continue; }
 
-                if (IsPlayerItem(parentName))
-                {
-                    result.PlayerCount++;
-                    Debug.Log($"{LOG_PREFIX}   [{itemIndex}] [플레이어 제외] '{itemName}' (ID:{itemTypeID})");
-                    continue;
-                }
+                if (parentName.Contains("Character")) { result.PlayerCount++; continue; }
+                if (parentName.StartsWith("Agent_Pickup") || parentName.Contains("Pickup")) { result.GroundCount++; continue; }
+                if (parentName.Contains("Tomb")) { result.TombCount++; continue; }
+                if (item.transform.parent.GetComponent<Item>() != null) { result.InventoryCount++; continue; }
+                if (item.transform.parent.GetComponent<Inventory>() == null) { result.InventoryCount++; continue; }
 
-                if (IsPickupItem(parentName))
-                {
-                    result.GroundCount++;
-                    continue;
-                }
-
-                if (IsTombItem(parentName))
-                {
-                    result.TombCount++;
-                    Debug.Log($"{LOG_PREFIX}   [{itemIndex}] [플레이어 시체 제외] '{itemName}' (ID:{itemTypeID}) - {parentName}");
-                    continue;
-                }
-
-                if (IsNestedItem(item))
-                {
-                    result.InventoryCount++;
-                    Debug.Log($"{LOG_PREFIX}   [{itemIndex}] [아이템 내부 제외] '{itemName}' (ID:{itemTypeID}) - Parent Item: {parentName}");
-                    continue;
-                }
-
-                if (!HasInventory(item))
-                {
-                    result.InventoryCount++;
-                    continue;
-                }
-
-                if (IsContainerItem(parentName))
-                {
-                    result.ContainerItems.Add(item);
-                    Debug.Log($"{LOG_PREFIX}   [{itemIndex}] [리롤 대상] '{itemName}' (ID:{itemTypeID}) - 컨테이너: {parentName}");
-                }
-                else
-                {
-                    result.InventoryCount++;
-                }
+                if (IsContainerItem(parentName)) result.ContainerItems.Add(item);
+                else result.InventoryCount++;
             }
-
             return result;
         }
-
-        private bool IsValidItem(Item item) => item != null && item.gameObject != null;
-        private bool HasParent(Item item) => item.transform.parent != null;
-        private bool IsPlayerItem(string parentName) => parentName.Contains("Character");
-        private bool IsPickupItem(string parentName) => parentName.StartsWith("Agent_Pickup") || parentName.Contains("Pickup");
-        private bool IsTombItem(string parentName) => parentName.Contains("Tomb");
-        private bool IsNestedItem(Item item) => item.transform.parent.GetComponent<Item>() != null;
-        private bool HasInventory(Item item) => item.transform.parent.GetComponent<Inventory>() != null;
 
         private bool IsContainerItem(string parentName)
         {
@@ -603,18 +789,12 @@ namespace ItemReroll
         }
     }
 
+    // ───────────────────────── 리롤러 ─────────────────────────
     internal class ItemReroller
     {
-        private const string LOG_PREFIX = "[ItemReroll]";
-
         public bool RerollItem(Item originalItem, ItemDatabase database)
         {
-            if (originalItem == null)
-            {
-                Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] 원본 아이템이 null");
-                return false;
-            }
-
+            if (originalItem == null) return false;
             try
             {
                 var inventory = GetInventory(originalItem);
@@ -628,166 +808,71 @@ namespace ItemReroll
 
                 SetRandomStack(newItem, database);
 
-                string oldName = originalItem.DisplayName;
-                int oldID = originalItem.TypeID;
-
                 if (!RemoveItem(inventory, index)) return false;
                 if (!AddItem(inventory, newItem, index)) return false;
 
-                Debug.Log($"{LOG_PREFIX} [리롤 성공] {oldName}(ID:{oldID}) -> {newItem.DisplayName}(ID:{newItem.TypeID})");
                 return true;
             }
-            catch (Exception ex)
+            catch
             {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] {originalItem.name} - {ex.Message}");
-                Debug.LogError($"{LOG_PREFIX} 스택 트레이스: {ex.StackTrace}");
                 return false;
             }
         }
 
-        private Inventory? GetInventory(Item item)
+        private Inventory GetInventory(Item item)
         {
-            if (item.transform.parent == null)
-            {
-                Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] {item.name} - Parent 없음");
-                return null;
-            }
-
-            string parentName = item.transform.parent.name;
-            Debug.Log($"{LOG_PREFIX}   - Parent: {parentName}");
-
-            var inventory = item.transform.parent.GetComponent<Inventory>();
-            if (inventory == null)
-            {
-                Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] {item.name} - Parent에 Inventory 컴포넌트 없음 (Parent: {parentName})");
-                return null;
-            }
-
-            Debug.Log($"{LOG_PREFIX}   - Inventory 발견: {inventory.name}");
-            return inventory;
+            var parent = item.transform.parent;
+            if (parent == null) return null;
+            return parent.GetComponent<Inventory>();
         }
 
         private int GetItemIndex(Inventory inventory, Item item)
         {
             var getIndexMethod = inventory.GetType().GetMethod("GetIndex");
-            if (getIndexMethod == null)
-            {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] {item.name} - GetIndex 메서드를 찾을 수 없음");
-                return -1;
-            }
-
-            Debug.Log($"{LOG_PREFIX}   - GetIndex 메서드 호출 중...");
-            int index = (int)getIndexMethod.Invoke(inventory, new object[] { item });
-            Debug.Log($"{LOG_PREFIX}   - 인덱스: {index}");
-
-            if (index < 0)
-            {
-                Debug.LogWarning($"{LOG_PREFIX} [리롤 실패] {item.name} - 인덱스를 찾을 수 없음");
-            }
-
-            return index;
+            if (getIndexMethod == null) return -1;
+            return (int)getIndexMethod.Invoke(inventory, new object[] { item });
         }
 
-        private Item? CreateRandomItem(ItemDatabase database)
+        private Item CreateRandomItem(ItemDatabase database)
         {
             int randomID = database.GetRandomID();
-            Debug.Log($"{LOG_PREFIX}   - 랜덤 ID 선택: {randomID}");
-
             var collectionType = ReflectionHelper.FindType("ItemAssetsCollection");
-            if (collectionType == null)
-            {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] ItemAssetsCollection 타입을 찾을 수 없음");
-                return null;
-            }
-
+            if (collectionType == null) return null;
             var instantiateMethod = collectionType.GetMethod("InstantiateSync", BindingFlags.Public | BindingFlags.Static);
-            if (instantiateMethod == null)
-            {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] InstantiateSync 메서드를 찾을 수 없음");
-                return null;
-            }
-
-            Debug.Log($"{LOG_PREFIX}   - InstantiateSync 호출 중...");
+            if (instantiateMethod == null) return null;
             var newItemObj = instantiateMethod.Invoke(null, new object[] { randomID });
-            var newItem = newItemObj as Item;
-
-            Debug.Log($"{LOG_PREFIX}   - 새 아이템 생성: {(newItem != null ? newItem.name : "null")}");
-
-            if (newItem == null)
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] ID {randomID} 생성 실패");
-
-            return newItem;
+            return newItemObj as Item;
         }
 
         private void SetRandomStack(Item item, ItemDatabase database)
         {
             int maxStack = database.GetMaxStack(item.TypeID);
             if (maxStack <= 1) return;
-
             int randomStack = UnityEngine.Random.Range(1, maxStack + 1);
-
             var stackProp = item.GetType().GetProperty("Stack") ?? item.GetType().GetProperty("Quantity");
-            if (stackProp != null && stackProp.CanWrite)
-            {
-                stackProp.SetValue(item, randomStack);
-                Debug.Log($"{LOG_PREFIX}   - Stack 설정: {randomStack}/{maxStack}");
-            }
+            if (stackProp != null && stackProp.CanWrite) stackProp.SetValue(item, randomStack);
         }
 
         private bool RemoveItem(Inventory inventory, int index)
         {
-            Debug.Log($"{LOG_PREFIX}   - 원본 아이템 제거 중...");
-
             var removeAtMethod = inventory.GetType().GetMethod("RemoveAt");
-            if (removeAtMethod == null)
-            {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] RemoveAt 메서드를 찾을 수 없음");
-                return false;
-            }
-
+            if (removeAtMethod == null) return false;
             object[] removeParams = new object[] { index, null };
             bool removed = (bool)removeAtMethod.Invoke(inventory, removeParams);
-
-            if (!removed)
-            {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] 아이템 제거 실패");
-                return false;
-            }
-
-            Debug.Log($"{LOG_PREFIX}   - 원본 아이템 제거 완료");
-
             var removedItem = removeParams[1] as Item;
-            if (removedItem != null)
-                UnityEngine.Object.Destroy(removedItem.gameObject);
-
-            return true;
+            if (removedItem != null) UnityEngine.Object.Destroy(removedItem.gameObject);
+            return removed;
         }
 
         private bool AddItem(Inventory inventory, Item item, int index)
         {
-            Debug.Log($"{LOG_PREFIX}   - AddAt 메서드 찾는 중...");
-
             var addAtMethod = inventory.GetType().GetMethod("AddAt");
-            if (addAtMethod == null)
-            {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] AddAt 메서드를 찾을 수 없음");
-                return false;
-            }
-
-            Debug.Log($"{LOG_PREFIX}   - AddAt 호출: 인덱스={index}, 새 아이템={item.name}");
-            bool added = (bool)addAtMethod.Invoke(inventory, new object[] { item, index });
-
-            if (!added)
-            {
-                Debug.LogError($"{LOG_PREFIX} [리롤 실패] 새 아이템 추가 실패");
-                return false;
-            }
-
-            Debug.Log($"{LOG_PREFIX}   - AddAt 완료");
-            return true;
+            if (addAtMethod == null) return false;
+            return (bool)addAtMethod.Invoke(inventory, new object[] { item, index });
         }
     }
 
+    // ─────────────────── 리플렉션 헬퍼 + 통화 브릿지 ───────────────────
     internal static class ReflectionHelper
     {
         public static Type FindType(string typeName)
@@ -797,10 +882,347 @@ namespace ItemReroll
                 .FirstOrDefault(type => type.Name == typeName || type.FullName == typeName);
         }
 
+        public static object GetSingletonOrAnyInstance(Type t)
+        {
+            // Common singleton patterns
+            var props = new[] { "Instance", "instance", "Inst", "inst", "Singleton", "singleton" };
+            foreach (var p in props)
+            {
+                var pi = t.GetProperty(p, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (pi != null)
+                {
+                    var val = pi.GetValue(null);
+                    if (val != null) return val;
+                }
+            }
+            var fields = new[] { "Instance", "instance", "Inst", "inst", "Singleton", "singleton" };
+            foreach (var f in fields)
+            {
+                var fi = t.GetField(f, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (fi != null)
+                {
+                    var val = fi.GetValue(null);
+                    if (val != null) return val;
+                }
+            }
+            var comp = UnityEngine.Object.FindObjectOfType(t) as Component;
+            if (comp != null) return comp;
+            return null;
+        }
+
         private static Type[] GetTypesFromAssembly(Assembly assembly)
         {
             try { return assembly.GetTypes(); }
             catch { return Array.Empty<Type>(); }
+        }
+    }
+
+    internal class CurrencyBridge
+    {
+        private object _target;
+        private FieldInfo _field;
+        private PropertyInfo _prop;
+        private MethodInfo _mGet, _mSet, _mAdd;
+
+        public bool DebugLog { get; private set; }
+
+        private string _hintType;
+        private string _hintMember;
+        private string _goName;
+        private string _hintMGet, _hintMSet, _hintMAdd;
+
+        private static readonly string[] CandidateNames = {
+            "Money","money","Credits","credits","Gold","gold",
+            "Balance","balance","Currency","currency","Cash","cash"
+        };
+
+        public void SetHints(string typeName, string memberName, string goName, string mGet, string mSet, string mAdd, bool debug)
+        {
+            _hintType = typeName;
+            _hintMember = memberName;
+            _goName = goName;
+            _hintMGet = mGet;
+            _hintMSet = mSet;
+            _hintMAdd = mAdd;
+            DebugLog = debug;
+        }
+
+        public void WarmUp()
+        {
+            TryLocateTarget();
+        }
+
+        private void Log(string msg)
+        {
+            if (DebugLog) Debug.Log("[ItemReroll][CurrencyBridge] " + msg);
+        }
+
+        private bool TryLocateTarget()
+        {
+            // 1) 힌트 기반 탐색
+            if (!string.IsNullOrEmpty(_hintType) || !string.IsNullOrEmpty(_hintMember) ||
+                !string.IsNullOrEmpty(_goName) || !string.IsNullOrEmpty(_hintMGet) ||
+                !string.IsNullOrEmpty(_hintMSet) || !string.IsNullOrEmpty(_hintMAdd))
+            {
+                if (TryLocateWithHints()) return true;
+            }
+
+            // 2) 휴리스틱
+            try
+            {
+                var tagged = GameObject.FindWithTag("Player");
+                if (tagged != null && TryScanObject(tagged)) return true;
+
+                foreach (var t in GameObject.FindObjectsOfType<Transform>())
+                {
+                    var n = t.name;
+                    if (string.IsNullOrEmpty(n)) continue;
+                    if (n.Contains("Player") || n.Contains("Character"))
+                    {
+                        if (TryScanObject(t.gameObject)) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private bool TryLocateWithHints()
+        {
+            Log("TryLocateWithHints()");
+            GameObject root = null;
+            if (!string.IsNullOrEmpty(_goName))
+            {
+                foreach (var t in GameObject.FindObjectsOfType<Transform>())
+                {
+                    if (!string.IsNullOrEmpty(t.name) && t.name.IndexOf(_goName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        root = t.gameObject;
+                        break;
+                    }
+                }
+                Log("GO search: " + (root ? root.name : "not found"));
+            }
+
+            Type tComp = null;
+            if (!string.IsNullOrEmpty(_hintType))
+            {
+                tComp = ReflectionHelper.FindType(_hintType);
+                Log("Type hint: " + (tComp != null ? tComp.FullName : "not found"));
+            }
+
+            object instance = null;
+            if (tComp != null)
+            {
+                if (root != null)
+                {
+                    var comp = root.GetComponentInChildren(tComp, true);
+                    if (comp != null) instance = comp;
+                }
+                if (instance == null)
+                {
+                    instance = ReflectionHelper.GetSingletonOrAnyInstance(tComp);
+                }
+            }
+            else if (root != null)
+            {
+                foreach (var c in root.GetComponentsInChildren<Component>(true))
+                {
+                    if (TryBindOnComponent(c, _hintMember)) { instance = c; break; }
+                }
+            }
+
+            if (instance != null)
+            {
+                var instType = instance.GetType();
+                if (!string.IsNullOrEmpty(_hintMGet))
+                    _mGet = instType.GetMethod(_hintMGet, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (!string.IsNullOrEmpty(_hintMSet))
+                    _mSet = instType.GetMethod(_hintMSet, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int) }, null)
+                         ?? instType.GetMethod(_hintMSet, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(float) }, null);
+                if (!string.IsNullOrEmpty(_hintMAdd))
+                    _mAdd = instType.GetMethod(_hintMAdd, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(int) }, null)
+                         ?? instType.GetMethod(_hintMAdd, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new[] { typeof(float) }, null);
+
+                if ((_mGet != null && (_mSet != null || _mAdd != null)) ||
+                    TryBindOnComponent(instance as Component, _hintMember))
+                {
+                    _target = instance;
+                    Log("Bind success via hints on: " + instType.FullName);
+                    return true;
+                }
+            }
+
+            // 타입만 있고 인스턴스를 못 찾은 경우
+            if (tComp != null && instance == null)
+            {
+                instance = ReflectionHelper.GetSingletonOrAnyInstance(tComp);
+                if (instance != null)
+                {
+                    if ((_mGet != null && (_mSet != null || _mAdd != null)) ||
+                        TryBindOnAnyMember(instance, _hintMember))
+                    {
+                        _target = instance;
+                        Log("Bind success via type singleton: " + instance.GetType().FullName);
+                        return true;
+                    }
+                }
+            }
+
+            foreach (var c in GameObject.FindObjectsOfType<Component>())
+            {
+                if (TryBindOnComponent(c, _hintMember))
+                {
+                    _target = c;
+                    Log("Bind success via scene scan: " + c.GetType().FullName);
+                    return true;
+                }
+            }
+
+            Log("Bind failed via hints.");
+            return false;
+        }
+
+        private bool TryBindOnComponent(Component comp, string preferMember)
+        {
+            if (comp == null) return false;
+            var type = comp.GetType();
+
+            if (!string.IsNullOrEmpty(preferMember))
+            {
+                var p = type.GetProperty(preferMember, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (p != null && (p.PropertyType == typeof(int) || p.PropertyType == typeof(float)) && p.CanRead)
+                { _prop = p; _field = null; return true; }
+
+                var f = type.GetField(preferMember, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (f != null && (f.FieldType == typeof(int) || f.FieldType == typeof(float)))
+                { _field = f; _prop = null; return true; }
+            }
+
+            foreach (var p in type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (!p.CanRead) continue;
+                if (!(p.PropertyType == typeof(int) || p.PropertyType == typeof(float))) continue;
+                if (!CandidateNames.Any(cn => string.Equals(cn, p.Name, StringComparison.OrdinalIgnoreCase))) continue;
+
+                if (p.CanWrite) { _prop = p; _field = null; return true; }
+            }
+            foreach (var f in type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (!(f.FieldType == typeof(int) || f.FieldType == typeof(float))) continue;
+                if (!CandidateNames.Any(cn => string.Equals(cn, f.Name, StringComparison.OrdinalIgnoreCase))) continue;
+
+                _field = f; _prop = null; return true;
+            }
+            return false;
+        }
+
+        private bool TryBindOnAnyMember(object instance, string preferMember)
+        {
+            var comp = instance as Component;
+            if (comp != null) return TryBindOnComponent(comp, preferMember);
+
+            var type = instance.GetType();
+            if (!string.IsNullOrEmpty(preferMember))
+            {
+                var p = type.GetProperty(preferMember, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (p != null && (p.PropertyType == typeof(int) || p.PropertyType == typeof(float)) && p.CanRead)
+                { _target = instance; _prop = p; _field = null; return true; }
+
+                var f = type.GetField(preferMember, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (f != null && (f.FieldType == typeof(int) || f.FieldType == typeof(float)))
+                { _target = instance; _field = f; _prop = null; return true; }
+            }
+            return false;
+        }
+
+        private bool TryScanObject(GameObject go)
+        {
+            foreach (var comp in go.GetComponentsInChildren<Component>(true))
+            {
+                if (TryBindOnComponent(comp, _hintMember)) { _target = comp; return true; }
+            }
+            return false;
+        }
+
+        public bool TryGetMoney(out int money)
+        {
+            money = 0;
+            if (_target == null && !TryLocateTarget()) return false;
+
+            try
+            {
+                if (_mGet != null)
+                {
+                    var val = _mGet.Invoke(_target, null);
+                    if (val is int i1) { money = i1; return true; }
+                    if (val is float f1) { money = Mathf.RoundToInt(f1); return true; }
+                }
+
+                object v = _prop != null ? _prop.GetValue(_target) : _field.GetValue(_target);
+                if (v is int i) { money = i; return true; }
+                if (v is float f) { money = Mathf.RoundToInt(f); return true; }
+            }
+            catch (Exception ex)
+            {
+                Log("TryGetMoney ex: " + ex.Message);
+            }
+            return false;
+        }
+
+        public bool TrySetMoney(int money)
+        {
+            if (_target == null && !TryLocateTarget()) return false;
+
+            try
+            {
+                if (_mSet != null)
+                {
+                    var ps = _mSet.GetParameters();
+                    if (ps.Length == 1 && ps[0].ParameterType == typeof(int))
+                    { _mSet.Invoke(_target, new object[] { money }); return true; }
+                    if (ps.Length == 1 && ps[0].ParameterType == typeof(float))
+                    { _mSet.Invoke(_target, new object[] { (float)money }); return true; }
+                }
+
+                if (_prop != null && _prop.CanWrite)
+                {
+                    if (_prop.PropertyType == typeof(int)) { _prop.SetValue(_target, money); return true; }
+                    if (_prop.PropertyType == typeof(float)) { _prop.SetValue(_target, (float)money); return true; }
+                }
+                else if (_field != null && !_field.IsInitOnly)
+                {
+                    if (_field.FieldType == typeof(int)) { _field.SetValue(_target, money); return true; }
+                    if (_field.FieldType == typeof(float)) { _field.SetValue(_target, (float)money); return true; }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("TrySetMoney ex: " + ex.Message);
+            }
+            return false;
+        }
+
+        public bool TrySpendMoney(int amount)
+        {
+            if (_target == null && !TryLocateTarget()) return false;
+
+            try
+            {
+                if (_mAdd != null)
+                {
+                    var ps = _mAdd.GetParameters();
+                    if (ps.Length == 1 && ps[0].ParameterType == typeof(int))
+                    { _mAdd.Invoke(_target, new object[] { -amount }); return true; }
+                    if (ps.Length == 1 && ps[0].ParameterType == typeof(float))
+                    { _mAdd.Invoke(_target, new object[] { (float)(-amount) }); return true; }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("TrySpendMoney ex: " + ex.Message);
+            }
+            return false;
         }
     }
 }
